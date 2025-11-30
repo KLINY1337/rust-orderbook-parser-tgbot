@@ -1,0 +1,15 @@
+[package]
+name = "rust-orderbook-parser-tgbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+teloxide = { version = "0.17.0", features = ["macros"] }
+tokio = { version = "1.48.0", features = ["full"] }
+log = "0.4.28"
+pretty_env_logger = "0.5.0"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+ordered-float = "4.0"
