@@ -1,3 +1,17 @@
+//! Telegram-бот для подписки на поток ордербука с биржи Bybit.
+//!
+//! Основные возможности:
+//! - Подписка на поток ордербука по одному тикеру на чат.
+//! - Выбор глубины ордербука (1 / 50 / 200 / 1000).
+//! - Задание интервала отправки сообщений (в миллисекундах).
+//! - Кнопка `STOP` под сообщением для остановки подписки.
+//!
+//! Бот:
+//! - Подключается к публичному WebSocket API Bybit.
+//! - Автоматически реконнектится при обрыве соединения.
+//! - Поддерживает heartbeat (ping/pong), чтобы соединение не разрывалось.
+//! - Форматирует ордербук в удобном виде для чтения в Telegram с HTML‑разметкой.
+
 use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -8,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use futures_util::{SinkExt, StreamExt};
 use ordered_float::OrderedFloat;
 
+/// Сообщение ордербука, приходящее по WebSocket от Bybit.
+///
+/// Поля соответствуют формату ответа API `/v5/public/linear` (orderbook).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderbookMessage {
     topic: String,
@@ -18,23 +35,39 @@ struct OrderbookMessage {
     cts: u64,
 }
 
+/// Данные по ордербуку внутри сообщения.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderbookData {
-    s: String,  // Symbol
-    b: Vec<[String; 2]>,  // Bids
-    a: Vec<[String; 2]>,  // Asks
-    u: u64,  // Update ID
-    seq: Option<u64>,  // Sequence
+    /// Торговый инструмент (символ), например `BTCUSDT`.
+    s: String,
+    /// Массив заявок на покупку: `[price, size]` в виде строк.
+    b: Vec<[String; 2]>,
+    /// Массив заявок на продажу: `[price, size]` в виде строк.
+    a: Vec<[String; 2]>,
+    /// Идентификатор обновления (update ID).
+    u: u64,
+    /// Последовательность (sequence), может отсутствовать.
+    seq: Option<u64>,
 }
 
+/// Внутреннее состояние ордербука, которое поддерживается в актуальном виде.
+///
+/// Для удобной сортировки:
+/// - `bids` (покупки) хранятся с отрицательной ценой, чтобы `BTreeMap`
+///   автоматически выдавал лучшие цены первыми;
+/// - `asks` (продажи) хранятся с положительной ценой в естественном порядке.
 #[derive(Debug, Clone)]
 struct OrderbookState {
-    bids: BTreeMap<OrderedFloat<f64>, f64>,  // price -> size (descending order)
-    asks: BTreeMap<OrderedFloat<f64>, f64>,  // price -> size (ascending order)
+    /// Покупки: цена (как отрицательное число) → объём.
+    bids: BTreeMap<OrderedFloat<f64>, f64>,
+    /// Продажи: цена → объём.
+    asks: BTreeMap<OrderedFloat<f64>, f64>,
+    /// Последний ID обновления, полученный от Bybit.
     last_update_id: u64,
 }
 
 impl OrderbookState {
+    /// Создаёт пустое состояние ордербука.
     fn new() -> Self {
         Self {
             bids: BTreeMap::new(),
@@ -43,10 +76,14 @@ impl OrderbookState {
         }
     }
 
+    /// Полностью пересобирает состояние ордербука из снимка (`snapshot`).
+    ///
+    /// Обычно первый пришедший снимок, после чего применяются дельты (`delta`).
     fn apply_snapshot(&mut self, data: &OrderbookData) {
         self.bids.clear();
         self.asks.clear();
         
+        // Заполняем bids
         for bid in &data.b {
             if let (Ok(price), Ok(size)) = (bid[0].parse::<f64>(), bid[1].parse::<f64>()) {
                 if size > 0.0 {
@@ -56,6 +93,7 @@ impl OrderbookState {
             }
         }
         
+        // Заполняем asks
         for ask in &data.a {
             if let (Ok(price), Ok(size)) = (ask[0].parse::<f64>(), ask[1].parse::<f64>()) {
                 if size > 0.0 {
@@ -67,6 +105,9 @@ impl OrderbookState {
         self.last_update_id = data.u;
     }
 
+    /// Применяет дельту (`delta`) к текущему состоянию ордербука.
+    ///
+    /// Если объём равен нулю — уровень цены удаляется.
     fn apply_delta(&mut self, data: &OrderbookData) {
         // Обновляем bids
         for bid in &data.b {
@@ -95,8 +136,13 @@ impl OrderbookState {
         self.last_update_id = data.u;
     }
 
-    fn format_orderbook(&self, symbol: &str, top_n: usize) -> String {
-        let mut result = format!("📊 <b>Orderbook: {}</b>\n\n", symbol);
+    /// Форматирует текущее состояние ордербука в человекочитаемый текст для Telegram.
+    ///
+    /// - `symbol` — тикер инструмента.
+    /// - `depth` — глубина, с которой мы подписались на Bybit.
+    /// - `top_n` — сколько лучших уровней цены показать в каждом стакане.
+    fn format_orderbook(&self, symbol: &str, depth: u32, top_n: usize) -> String {
+        let mut result = format!("📊 <b>Orderbook: {} (глубина {})</b>\n\n", symbol, depth);
         
         // Форматируем лучшие asks (продажи) - сверху
         result.push_str("<b>🔼 ASK (Продажи)</b>\n");
@@ -135,6 +181,8 @@ impl OrderbookState {
     }
 }
 
+/// Форматирование цены в зависимости от её величины
+/// (чтобы крупные числа не отображались с избыточной точностью).
 fn format_price(price: f64) -> String {
     if price >= 1000.0 {
         format!("{:.2}", price)
@@ -145,6 +193,7 @@ fn format_price(price: f64) -> String {
     }
 }
 
+/// Форматирование объёма аналогично форматированию цены.
 fn format_size(size: f64) -> String {
     if size >= 1000.0 {
         format!("{:.2}", size)
@@ -155,20 +204,38 @@ fn format_size(size: f64) -> String {
     }
 }
 
+/// Описание активной подписки для конкретного чата.
 #[derive(Debug, Clone)]
 struct Subscription {
+    /// Символ (тикер), на который подписан пользователь.
     symbol: String,
+    /// Интервал отправки ордербука в миллисекундах.
     interval_ms: u32,
+    /// Идентификатор Telegram-чата.
     chat_id: ChatId,
+    /// Канал для остановки фоновой задачи по запросу пользователя.
     stop_tx: mpsc::Sender<()>,
 }
 
+/// Общая структура для хранения подписок:
+/// `ChatId` → `Subscription`. Оборачивается в `Arc<RwLock<...>>`
+/// для безопасного доступа из нескольких задач.
 type SubscriptionMap = Arc<RwLock<HashMap<ChatId, Subscription>>>;
 
-fn parse_message(text: &str) -> Option<(String, u32)> {
+/// Парсинг текстового сообщения пользователя в параметры подписки.
+///
+/// Ожидаемый формат сообщения:
+/// ```text
+/// Тикер: BTCUSDT
+/// Интервал отправки: 1000
+/// Глубина: 50
+/// ```
+///
+/// Возвращает `(тикер, интервал_в_мс, глубина)`, либо `None`, если формат неверен.
+fn parse_message(text: &str) -> Option<(String, u32, u32)> {
     let lines: Vec<&str> = text.lines().collect();
     
-    if lines.len() < 2 {
+    if lines.len() < 3 {
         return None;
     }
     
@@ -185,18 +252,40 @@ fn parse_message(text: &str) -> Option<(String, u32)> {
     if !interval_line.starts_with("Интервал отправки:") {
         return None;
     }
-    let interval_str = interval_line.strip_prefix("Интервал отправки:").unwrap_or("").trim();
+    let interval_str = interval_line
+        .strip_prefix("Интервал отправки:")
+        .unwrap_or("")
+        .trim();
     if interval_str.is_empty() {
         return None;
     }
     
-    if let Ok(interval) = interval_str.parse::<u32>() {
-        Some((ticker.to_string(), interval))
-    } else {
-        None
+    let interval: u32 = interval_str.parse().ok()?;
+    
+    // Парсим глубину
+    let depth_line = lines[2].trim();
+    if !depth_line.starts_with("Глубина:") {
+        return None;
+    }
+    let depth_str = depth_line.strip_prefix("Глубина:").unwrap_or("").trim();
+    if depth_str.is_empty() {
+        return None;
+    }
+    let depth: u32 = depth_str.parse().ok()?;
+    
+    // Разрешенные значения глубины
+    match depth {
+        1 | 50 | 200 | 1000 => Some((ticker.to_string(), interval, depth)),
+        _ => None,
     }
 }
 
+/// Запускает и поддерживает WebSocket‑подключение к Bybit с автореконнектом.
+///
+/// - Подписывается на топик ордербука.
+/// - Поддерживает heartbeat (ping/pong).
+/// - Обновляет `orderbook_state` при получении `snapshot` и `delta`.
+/// - По сигналу в `stop_rx` корректно завершает работу.
 async fn run_websocket_connection(
     ws_url: String,
     topic: String,
@@ -358,7 +447,7 @@ async fn run_websocket_connection(
                 ping_task.abort();
                 
                 if !connection_lost {
-                    // Получен сигнал остановки
+                    // Получен сигнал остановки — выходим без реконнекта
                     return Err(());
                 }
                 
@@ -393,18 +482,29 @@ async fn run_websocket_connection(
     }
 }
 
+/// Запускает полный цикл работы для конкретной подписки:
+/// - WebSocket‑подключение к Bybit (`run_websocket_connection`);
+/// - периодическая отправка отформатированного ордербука в Telegram;
+/// - остановка по сигналу и очистка записи о подписке.
 async fn start_orderbook_stream(
     bot: Bot,
     symbol: String,
     interval_ms: u32,
+    depth: u32,
     chat_id: ChatId,
     subscriptions: SubscriptionMap,
     mut stop_rx: mpsc::Receiver<()>,
 ) {
+    // Публичный WebSocket эндпоинт для линейных контрактов
     let ws_url = format!("wss://stream.bybit.com/v5/public/linear");
-    let topic = format!("orderbook.50.{}", symbol);
+    let topic = format!("orderbook.{}.{}", depth, symbol);
     
-    log::info!("Запускаем поток orderbook для {} с интервалом {}ms", symbol, interval_ms);
+    log::info!(
+        "Запускаем поток orderbook для {} с глубиной {} и интервалом {}ms",
+        symbol,
+        depth,
+        interval_ms
+    );
     
     let orderbook_state = Arc::new(RwLock::new(OrderbookState::new()));
     let orderbook_state_clone = orderbook_state.clone();
@@ -434,7 +534,7 @@ async fn start_orderbook_stream(
             _ = interval.tick() => {
                 let state = orderbook_state.read().await;
                 if !state.bids.is_empty() || !state.asks.is_empty() {
-                    let formatted = state.format_orderbook(&symbol, 10);
+                    let formatted = state.format_orderbook(&symbol, depth, 10);
                     
                     let keyboard = InlineKeyboardMarkup::new(vec![vec![
                         InlineKeyboardButton::callback("🛑 STOP", format!("stop_{}", chat_id.0))
@@ -525,7 +625,7 @@ async fn handle_message(
             return Ok(());
         }
         
-        if let Some((ticker, interval)) = parse_message(text) {
+        if let Some((ticker, interval, depth)) = parse_message(text) {
             let chat_id = msg.chat.id;
             
             // Останавливаем предыдущую подписку, если есть
@@ -550,14 +650,15 @@ async fn handle_message(
                 bot.clone(),
                 ticker.clone(),
                 interval,
+                depth,
                 chat_id,
                 subscriptions.clone(),
                 stop_rx,
             ));
             
             let response = format!(
-                "✅ Подписка активирована!\n\nТикер: {}\nИнтервал отправки: {} мс\n\nOrderbook будет отправляться автоматически.",
-                ticker, interval
+                "✅ Подписка активирована!\n\nТикер: {}\nИнтервал отправки: {} мс\nГлубина: {}\n\nOrderbook будет отправляться автоматически.",
+                ticker, interval, depth
             );
             
             let keyboard = InlineKeyboardMarkup::new(vec![vec![
